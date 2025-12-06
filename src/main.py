@@ -2,8 +2,6 @@ from .data_loading import load_interactions, load_games
 from .preprocessing import (
     reindex_interactions,
     create_interaction_matrix,
-    min_users_per_item,
-    min_items_per_user,
 )
 from .eda import (
     check_missing_values,
@@ -19,7 +17,216 @@ from .lgbm_dataset import build_lgbm_dataset
 from .models_lgbm import train_lgbm_ranker, evaluate_lgbm_on_split
 from .fairness import evaluate_provider_fairness, compute_publisher_weights, make_lgbm_sample_weights
 
+def run_lgbm_fairness_experiments(
+        train_df,
+        test_df,
+        X_items,
+        items_df,
+        lambda_values,
+        n_neg_per_pos: int = 4,
+        random_state: int = 42,
+):
+    """
+    Run the LightGBM + fairness experiments for different lambda_fair values.
+
+    Parameters
+    ----------
+    train_df : pd.DataFrame
+        Training interactions (user_id, item_id, ...).
+    test_df : pd.DataFrame
+        Test interactions used for evaluation.
+    X_items : scipy sparse matrix
+        Item feature matrix (n_items x n_features).
+    items_df : pd.DataFrame
+        DataFrame with item-level metadata aligned with X_items.
+    lambda_values : list of float
+        List of lambda_fair values to evaluate.
+    n_neg_per_pos : int
+        Number of negative samples per positive interaction.
+    random_state : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    list of dict
+        One dict per lambda_fair with metrics:
+        { "lambda_fair", "recall@10", "ndcg@10", "gini@10" }.
+    """
+    print("\nBuilding LightGBM training dataset...")
+    n_items_total = X_items.shape[0]
+
+    X_train_lgbm, y_train_lgbm, group_train, user_ids_train, item_ids_train = build_lgbm_dataset(
+        train_df,
+        n_items=n_items_total,
+        X_items=X_items,
+        n_neg_per_pos=n_neg_per_pos,
+        random_state=random_state,
+    )
+
+    print("LightGBM train dataset built.")
+    print("X_train_lgbm shape:", X_train_lgbm.shape)
+    print("y_train_lgbm shape:", y_train_lgbm.shape)
+    print("Number of groups (users) in train:", len(group_train))
+
+    # Base publisher weights
+    pub_weights = compute_publisher_weights(items_df, power=1.0)
+
+    # Mapping from item_id to publisher (used for fairness evaluation)
+    item_to_publisher = items_df["publisher_clean"].to_dict()
+
+    lgbm_results = []
+    for lambda_fair in lambda_values:
+        print("\n" + "=" * 60)
+        print(f"Training LightGBM with lambda_fair = {lambda_fair}")
+        print("=" * 60)
+
+        # Interpolated per-example sample weights
+        sample_weights = make_lgbm_sample_weights(
+            item_ids=item_ids_train,
+            items_df=items_df,
+            pub_weights=pub_weights,
+            lambda_fair=lambda_fair,
+        )
+
+        # Train LightGBM ranker
+        print("\nTraining LightGBM ranker...")
+        lgbm_model = train_lgbm_ranker(
+            X_train=X_train_lgbm,
+            y_train=y_train_lgbm,
+            group_train=group_train,
+            X_val=None,
+            y_val=None,
+            group_val=None,
+            num_leaves=63,
+            learning_rate=0.05,
+            n_estimators=200,
+            min_data_in_leaf=50,
+            feature_fraction=0.8,
+            lambda_l2=0.0,
+            random_state=random_state,
+            sample_weight=sample_weights,
+        )
+        print("LightGBM model trained.")
+
+        # Evaluate LightGBM model on test split
+        print("\nEvaluating LightBGM model on test split...")
+        lgbm_recall, lgbm_ndcg, lgbm_user_recs = evaluate_lgbm_on_split(
+            lgbm_model,
+            X_items=X_items,
+            train_df=train_df,
+            test_df=test_df,
+            k=10,
+        )
+        print(f"LightGBM Recall@10: {lgbm_recall:.4f}")
+        print(f"LightGBM NDCG@10: {lgbm_ndcg:.4f}")
+
+        #Provider fairness for LightGBM
+        lgbm_gini, lgbm_exposure = evaluate_provider_fairness(
+            lgbm_user_recs,
+            item_to_publisher=item_to_publisher,
+            k=10,
+        )
+        print(f"LightGBM provider Gini@10: {lgbm_gini:.4f}")
+        print("Top 5 publishers by exposure (LightGBM):")
+        print(lgbm_exposure.head(5))
+
+        #Save scalar metrics
+        lgbm_results.append(
+            {
+                "lambda_fair": lambda_fair,
+                "recall@10": lgbm_recall,
+                "ndcg@10": lgbm_ndcg,
+                "gini@10": lgbm_gini,
+            }
+        )
+
+    print("\n\n-- Summary: LightGBM fairness-accuracy trade-off --")
+    print("lambda_fair | Recall@10 | NDCG@10 | Gini@10")
+    for res in lgbm_results:
+        print(
+            f"{res['lambda_fair']:10.2f} | "
+            f"{res['recall@10']:.4f} | "
+            f"{res['ndcg@10']:.4f} | "
+            f"{res['gini@10']:.4f}"
+        )
+
+    return lgbm_results
+
+def run_ease_baseline(train_df, test_df, item_to_publisher, lambda_reg: float = 1e3, K: int = 10):
+    """
+    Train and evaluate the EASE baseline model, including provider fairness.
+
+    Parameters
+    ----------
+    train_df : pd.DataFrame
+        Training interactions.
+    test_df : pd.DataFrame
+        Test interactions (ground truth).
+    item_to_publisher : dict
+        Mapping from item_id to publisher.
+    lambda_reg : float
+        L2 regularization parameter for EASE.
+    K : int
+        Cutoff for top-K recommendations.
+
+    Returns
+    -------
+    dict
+        Metrics and exposure information for EASE:
+        { "recall@K", "ndcg@K", "gini@K", "exposure_df" }.
+    """
+    print("\nCreating interaction matrix for EASE...")
+    X = create_interaction_matrix(train_df)
+    print("Done. Shape:", X.shape)
+    print("Density:", X.nnz / (X.shape[0] * X.shape[1]))
+
+    print("\nTraining EASE model...")
+    B = train_ease(X, l2_reg=lambda_reg)
+    print("Done.")
+
+    print("\nPreparing ground truth from test set...")
+    user_relevance = (
+        test_df.groupby("user_id")["item_id"]
+        .apply(set)
+        .to_dict()
+    )
+
+    print("\nGenerating EASE recommendations...")
+    user_recs = {}
+    n_users = X.shape[0]
+
+    for user_id in range(n_users):
+        if user_id not in user_relevance:
+            continue
+        rec_items = recommend_ease_for_user(X, B, user_id, top_k=K)
+        user_recs[user_id] = rec_items
+
+    print("\nEvaluating EASE recommendations...")
+    avg_recall, avg_ndcg = evaluate_topk(user_recs, user_relevance, k=K)
+    print(f"EASE Average Recall@{K}: {avg_recall:.4f}")
+    print(f"EASE Average NDCG@{K}: {avg_ndcg:.4f}")
+
+    print("\nEvaluating provider fairness for EASE...")
+    ease_gini, ease_exposure = evaluate_provider_fairness(
+        user_recs,
+        item_to_publisher=item_to_publisher,
+        k=K,
+    )
+    print(f"EASE provider Gini@{K}: {ease_gini:.4f}")
+    print("Top 5 publishers by exposure (EASE):")
+    print(ease_exposure.head(5))
+
+    return {
+        "recall@K": avg_recall,
+        "ndcg@K": avg_ndcg,
+        "gini@K": ease_gini,
+        "exposure_df": ease_exposure,
+    }
+
+
 def main():
+
+    # Load data
     interactions_df = load_interactions()
     games_df = load_games()
     
@@ -32,6 +239,7 @@ def main():
     print("\nFirst 5 games:")
     print(games_df.head())
 
+    # EDA checks
     check_missing_values(interactions_df, "train_interactions")
     check_missing_values(games_df, "games")
     check_duplicates_and_keys(interactions_df, games_df)
@@ -63,170 +271,34 @@ def main():
     # Maping from reindexed item_id -> publisher name
     item_to_publisher = items_df["publisher_clean"].to_dict()
 
-    # Build LightGBM datasets
-    print("\nBuilding LightGBM datasets...")
-    n_items_total = X_items.shape[0]
-
-    X_train_lgbm, y_train_lgbm, group_train, user_ids_train, item_ids_train = build_lgbm_dataset(
-        train_df,
-        n_items=n_items_total,
+    # LightGBM + fairness experiments
+    lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
+    lgbm_results = run_lgbm_fairness_experiments(
+        train_df=train_df,
+        test_df=test_df,
         X_items=X_items,
+        items_df=items_df,
+        lambda_values=lambda_values,
         n_neg_per_pos=4,
         random_state=42,
     )
 
-    print("LightGBM train dataset built.")
-    print("X_train_lgbm shape:", X_train_lgbm.shape)
-    print("y_train_lgbm shape:", y_train_lgbm.shape)
-    print("Number of groups (users) in train:", len(group_train))
-
-    # Fairness-aware sample weights for LightGBM
-    # 1) base weights per publisher (inverse frequency)
-    pub_weights = compute_publisher_weights(items_df, power=1.0)
-
-    #2) per-example weights interpolated with lambda_fair
-    lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
-    lgbm_results = []
-
-    for lambda_fair in lambda_values:
-        print("\n" + "=" * 60)
-        print(f"Training LightGBM with lambda_fair = {lambda_fair}")
-        print("=" * 60)
-
-
-        sample_weights = make_lgbm_sample_weights(
-            item_ids=item_ids_train,
-            items_df=items_df,
-            pub_weights=pub_weights,
-            lambda_fair=lambda_fair,
-        )
-
-
-        # Train LightGBM ranker
-        print("\nTraining LightGBM ranker...")
-        lgbm_model = train_lgbm_ranker(
-            X_train=X_train_lgbm,
-            y_train=y_train_lgbm,
-            group_train=group_train,
-            X_val=None,
-            y_val=None,
-            group_val=None,
-            num_leaves=63,
-            learning_rate=0.05,
-            n_estimators=200,
-            min_data_in_leaf=50,
-            feature_fraction=0.8,
-            lambda_l2=0.0,
-            random_state=42,
-            sample_weight=sample_weights,
-        )
-        print("LightGBM model trained.")
-
-        # Evaluate LightGBM model on test split
-        print("\nEvaluating LightGBM model on test split...")
-        lgbm_recall, lgbm_ndcg, lgbm_user_recs = evaluate_lgbm_on_split(
-            lgbm_model,
-            X_items=X_items,
-            train_df=train_df,
-            test_df=test_df,
-            k=10,
-        )
-        print(f"LightGBM Recall@10: {lgbm_recall:.4f}")
-        print(f"LightGBM NDCG@10: {lgbm_ndcg:.4f}")
-
-        # Provider fairness for LightGBM
-        lgbm_gini, lgbm_exposure = evaluate_provider_fairness(
-            lgbm_user_recs,
-            item_to_publisher=item_to_publisher,
-            k=10,
-        )
-        print(f"LightGBM provider Gini@10: {lgbm_gini:.4f}")
-        print("Top 5 publishers by exposure (LightGBM):")
-        print(lgbm_exposure.head(5))
-
-        # Save results
-        lgbm_results.append(
-            {
-                "lambda_fair": lambda_fair,
-                "recall@10": lgbm_recall,
-                "ndcg@10": lgbm_ndcg,
-                "gini@10": lgbm_gini,
-            }
-        )
-
-    print("\n\n--Summary: LightGBM fairness-accuracy trade-off--")
-    print("lambda_fair | Recall@10 | NDCG@10 | Gini@10")
-    for res in lgbm_results:
-        print(
-            f"{res['lambda_fair']:10.2f} | "
-            f"{res['recall@10']:.4f} | "
-            f"{res['ndcg@10']:.4f} | "
-            f"{res['gini@10']:.4f}"
-        )
-
-    # Create interaction matrix (only if needed)
-    print("\nCreating interaction matrix...")
-    X = create_interaction_matrix(train_df)
-    print("Done. Shape:", X.shape)
-    print("Density:", X.nnz / (X.shape[0] * X.shape[1]))
-
-    # MIN_USERS_PER_ITEM = 20
-    # MIN_ITEMS_PER_USER = 5
-
-    # print(f"\nFiltering items with < {MIN_USERS_PER_ITEM} users...")
-    # X, new_to_old_item = min_users_per_item(X, new_to_old_item, MIN_USERS_PER_ITEM)
-    # print("Done. Shape:", X.shape)
-
-    # print(f"\nFiltering users with < {MIN_ITEMS_PER_USER} items...")
-    # X, new_to_old_user = min_items_per_user(X, new_to_old_user, MIN_ITEMS_PER_USER)
-    # print("Done. Shape:", X.shape)
-
-    # print("\nFinal interaction matrix shape:", X.shape)
-    # print(" #users:", X.shape[0])
-    # print(" #items:", X.shape[1])
-    # print(" density:", X.nnz / (X.shape[0] * X.shape[1]))
-
-    # Train EASE model
-    print("\nTraining EASE model...")
-    lambda_reg = 1e3
-    B = train_ease(X, l2_reg=lambda_reg)
-    print("Done.")
-
-    # Prepare ground truth from test set
-    print("\nPreparing ground truth from test set...")
-    user_relevance = (
-        test_df.groupby("user_id")["item_id"]
-        .apply(set)
-        .to_dict()
-    )
-
-    # Generate recommendations for each user
-    print("\nGenerating recommendations...")
-    user_recs = {}
-    n_users = X.shape[0]
-    K = 10
-
-    for user_id in range(n_users):
-        if user_id not in user_relevance:
-            continue  # Only recommend for users in test set
-        rec_items = recommend_ease_for_user(X, B, user_id, top_k=K)
-        user_recs[user_id] = rec_items
-
-    # Evaluate recommendations
-    print("\nEvaluating recommendations...")
-    avg_recall, avg_ndcg = evaluate_topk(user_recs, user_relevance, k=K)
-    print(f"Average Recall@{K}: {avg_recall:.4f}")
-    print(f"Average NDCG@{K}: {avg_ndcg:.4f}")
-
-    # Provider fairness for EASE
-    ease_gini, ease_exposure = evaluate_provider_fairness(
-        user_recs,
+    # EASE baseline
+    ease_results = run_ease_baseline(
+        train_df=train_df,
+        test_df=test_df,
         item_to_publisher=item_to_publisher,
-        k=K,
+        lambda_reg=1e3,
+        K=10,
     )
-    print(f"EASE provider Gini@{K}: {ease_gini:.4f}")
-    print("Top 5 publishers by exposure (EASE):")
-    print(ease_exposure.head(5))
+
+    print("\n\n=== Final summary ===")
+    print("LightGBM fairness trade-off (per lambda_fair):")
+    print(lgbm_results)
+    print("\nEASE baseline results:")
+    print(ease_results)
+
+
 
 if __name__ == "__main__":
     main()

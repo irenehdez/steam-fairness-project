@@ -100,13 +100,12 @@ def run_lgbm_fairness_experiments(
             group_val=None,
             num_leaves=63,
             learning_rate=0.05,
-            n_estimators=200,
+            n_estimators=n_estimators,
             min_data_in_leaf=50,
             feature_fraction=0.8,
             lambda_l2=0.0,
             random_state=random_state,
             sample_weight=sample_weights,
-            n_estimators=n_estimators,
         )
         print("LightGBM model trained.")
 

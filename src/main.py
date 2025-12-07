@@ -256,7 +256,7 @@ def main():
     
     # Subconjunto para acelerar
     if DEBUG:
-        N_USERS_DEBUG = 5000
+        N_USERS_DEBUG = 15000
         unique_users = interactions_reindexed["user_id"].drop_duplicates()
         print("Total users:", len(unique_users))
 
@@ -286,8 +286,8 @@ def main():
 
     # LightGBM + fairness experiments
     if DEBUG:
-        lambda_values = [0.0, 1.0]
-        n_estimators = 50
+        lambda_values = [0.0, 0.5, 1.0]
+        n_estimators = 100
     else:
         lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
         n_estimators = 200

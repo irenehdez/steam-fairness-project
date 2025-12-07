@@ -25,6 +25,7 @@ def run_lgbm_fairness_experiments(
         lambda_values,
         n_neg_per_pos: int = 4,
         random_state: int = 42,
+        n_estimators: int = 200,
 ):
     """
     Run the LightGBM + fairness experiments for different lambda_fair values.
@@ -105,6 +106,7 @@ def run_lgbm_fairness_experiments(
             lambda_l2=0.0,
             random_state=random_state,
             sample_weight=sample_weights,
+            n_estimators=n_estimators,
         )
         print("LightGBM model trained.")
 
@@ -225,6 +227,7 @@ def run_ease_baseline(train_df, test_df, item_to_publisher, lambda_reg: float = 
 
 
 def main():
+    DEBUG = True # False experimento grande
 
     # Load data
     interactions_df = load_interactions()
@@ -252,6 +255,17 @@ def main():
     print("Done. Users:", interactions_reindexed['user_id'].nunique(),
           "Items:", interactions_reindexed['item_id'].nunique())
     
+    # Subconjunto para acelerar
+    if DEBUG:
+        N_USERS_DEBUG = 5000
+        unique_users = interactions_reindexed["user_id"].drop_duplicates()
+        print("Total users:", len(unique_users))
+
+        sample_users = unique_users.sample(N_USERS_DEBUG, random_state=42)
+        interactions_reindexed = interactions_reindexed[interactions_reindexed["user_id"].isin(sample_users)]
+        print(f"[DEBUG] Using only {N_USERS_DEBUG} users."
+              f"New interactions size: {len(interactions_reindexed)}")
+    
     # Weak generalization split
     print("\nPerforming weak generalization split...")
     train_df, val_df, test_df = weak_generalization_split(interactions_reindexed)
@@ -272,7 +286,13 @@ def main():
     item_to_publisher = items_df["publisher_clean"].to_dict()
 
     # LightGBM + fairness experiments
-    lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
+    if DEBUG:
+        lambda_values = [0.0, 1.0]
+        n_estimators = 50
+    else:
+        lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
+        n_estimators = 200
+    
     lgbm_results = run_lgbm_fairness_experiments(
         train_df=train_df,
         test_df=test_df,
@@ -281,6 +301,7 @@ def main():
         lambda_values=lambda_values,
         n_neg_per_pos=4,
         random_state=42,
+        n_estimators=n_estimators,
     )
 
     # EASE baseline

@@ -26,6 +26,7 @@ def run_lgbm_fairness_experiments(
         n_neg_per_pos: int = 4,
         random_state: int = 42,
         n_estimators: int = 200,
+        pub_power: float = 1.0,
 ):
     """
     Run the LightGBM + fairness experiments for different lambda_fair values.
@@ -70,7 +71,7 @@ def run_lgbm_fairness_experiments(
     print("Number of groups (users) in train:", len(group_train))
 
     # Base publisher weights
-    pub_weights = compute_publisher_weights(items_df, power=1.0)
+    pub_weights = compute_publisher_weights(items_df, power=pub_power)
 
     # Mapping from item_id to publisher (used for fairness evaluation)
     item_to_publisher = items_df["publisher_clean"].to_dict()
@@ -286,11 +287,13 @@ def main():
 
     # LightGBM + fairness experiments
     if DEBUG:
-        lambda_values = [0.0, 0.5, 1.0]
+        lambda_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
         n_estimators = 100
+        pub_power = 1.5
     else:
         lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
         n_estimators = 200
+        pub_power = 1.0
     
     lgbm_results = run_lgbm_fairness_experiments(
         train_df=train_df,
@@ -301,6 +304,7 @@ def main():
         n_neg_per_pos=4,
         random_state=42,
         n_estimators=n_estimators,
+        pub_power=pub_power,
     )
 
     # EASE baseline
@@ -311,6 +315,17 @@ def main():
         lambda_reg=1e3,
         K=10,
     )
+
+    try:
+        import pandas as pd
+
+        df_lgbm = pd.DataFrame(lgbm_results)
+        df_lgbm.to_csv("results_lgbm_inproc_debug.csv", index=False)
+
+        ease_results["exposure_df"].to_csv("results_ease_exposure_debug.csv")
+        print("\nSaved results to results_lgbm_inproc_debug.csv and results_ease_exposure_debug.csv")
+    except Exception as e:
+        print("Could not save results to CSV", e)
 
     print("\n\n=== Final summary ===")
     print("LightGBM fairness trade-off (per lambda_fair):")

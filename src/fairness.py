@@ -114,6 +114,70 @@ def compute_publisher_weights(
     pub_weights = dict(zip(counts.index, inv))
     return pub_weights
 
+def compute_exposure_correction_weights(
+        exposure: pd.Series,
+        items_df: pd.DataFrame,
+        target_mode: str = "catalog",
+        power: float = 1.0,
+        clip_min: float = 0.1,
+        clip_max: float = 10.0,
+) -> Dict[str, float]:
+    """
+    Compute publisher weights based on *actual exposure* instead of catalog
+    frequency.
+
+    Parameters
+    ----------
+    exposure : pd.Series
+        Index = publisher name, values = exposure counts (e.g. from
+        evaluate_provider_fairness(...)[1]).
+    items_df : pd.DataFrame
+        Must have column 'publisher_clean'.
+    target_mode : {'uniform', 'catalog'}
+        - 'uniform': target exposure is equal for all publishers.
+        - 'catalog': target exposure proportional to number of items
+          each publisher has in the catalog.
+    power : float
+        Strength of the correction. Higher values amplify differences
+        between over- and under-exposed publishers.
+    clip_min, clip_max : float
+        Clamp the resulting weights to avoid extreme values.
+
+    Returns
+    -------
+    pub_weights : dict
+        Mapping publisher_name -> weight. Mean weight is normalized to 1.0.
+    """
+    exposure = exposure.astype(float).copy()
+    exposure = exposure[exposure > 0]
+    actual = exposure/exposure.sum()
+
+    #Target exposure distribution
+    if target_mode == "uniform":
+        target = pd.Series(1.0 / len(actual), index=actual.index)
+    elif target_mode == "catalog":
+        counts = items_df["publisher_clean"].value_counts()
+        counts = counts.reindex(actual.index).fillna(0)
+        if counts.sum() == 0:
+            # Fall back to uniform if something weird happens
+            target = pd.Series(1.0 / len(actual), index=actual.index)
+        else:
+            target = counts / counts.sum()
+    else:
+        raise ValueError(f"Unknown target_mode: {target_mode}")
+    
+    eps = 1e-9
+    ratio = (target / (actual + eps)) ** power
+
+    # Clip to avoid crazy weights
+    ratio = ratio.clip(lower=clip_min, upper=clip_max)
+
+    # Normalize so that mean weight = 1
+    ratio = ratio / ratio.mean()
+
+    pub_weights = ratio.to_dict()
+    return pub_weights
+
 
 def make_lgbm_sample_weights(
         item_ids: np.ndarray,

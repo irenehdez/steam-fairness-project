@@ -15,7 +15,12 @@ from .metrics import evaluate_topk
 from .features import build_item_feature_matrix
 from .lgbm_dataset import build_lgbm_dataset
 from .models_lgbm import train_lgbm_ranker, evaluate_lgbm_on_split
-from .fairness import evaluate_provider_fairness, compute_publisher_weights, make_lgbm_sample_weights
+from .fairness import (
+    evaluate_provider_fairness, 
+    compute_publisher_weights, 
+    make_lgbm_sample_weights,
+    compute_exposure_correction_weights,
+)
 
 def run_lgbm_fairness_experiments(
         train_df,
@@ -154,6 +159,198 @@ def run_lgbm_fairness_experiments(
 
     return lgbm_results
 
+def run_lgbm_exposure_fairness_experiments(
+        train_df,
+        test_df,
+        X_items,
+        items_df,
+        lambda_values,
+        n_neg_per_pos: int = 4,
+        random_state: int = 42,
+        n_estimators: int = 100,
+        exp_power: float = 1.0,
+        target_mode: str = "catalog"
+):
+    """
+    Two-stage exposure-aware in-processing method:
+
+    1) Train a baseline LightGBM model without fairness weights and measure
+       provider exposure.
+    2) Derive publisher weights from the mismatch between actual and target
+       exposure distributions.
+    3) Train new LightGBM models with sample weights based on these
+       exposure-aware publisher weights, interpolated by lambda_fair.
+
+    Parameters
+    ----------
+    train_df, test_df : pd.DataFrame
+    X_items : scipy sparse matrix
+        Item feature matrix (n_items x n_features).
+    items_df : pd.DataFrame
+        Item metadata aligned with X_items (index = new_item_id).
+    lambda_values : list of float
+        Values of lambda_fair in [0, 1] to evaluate.
+    n_neg_per_pos : int
+        Number of negative samples per positive interaction.
+    random_state : int
+    n_estimators : int
+        Number of boosting rounds for LightGBM.
+    exp_power : float
+        Strength of exposure correction in compute_exposure_correction_weights.
+    target_mode : {'uniform', 'catalog'}
+        Exposure target distribution.
+
+    Returns
+    -------
+    baseline_metrics : dict
+        Metrics for the baseline (no fairness) model.
+    lgbm_results : list of dict
+        One dict per lambda_fair with metrics:
+        { "lambda_fair", "recall@10", "ndcg@10", "gini@10" }.
+    """
+    print("\n[Stage 1] Building LightGBM training dataset...")
+    n_items_total = X_items.shape[0]
+
+    X_train_lgbm, y_train_lgbm, group_train, _, item_ids_train = build_lgbm_dataset(
+        train_df,
+        n_items=n_items_total,
+        X_items=X_items,
+        n_neg_per_pos=n_neg_per_pos,
+        random_state=random_state,
+    )
+
+    print("LightGBM train dataset built.")
+    print("X_train_lgbm shape:", X_train_lgbm.shape)
+    print("y_train_lgbm shape:", y_train_lgbm.shape)
+    print("Number of groups (users) in train:", len(group_train))
+
+    item_to_publisher = items_df["publisher_clean"].to_dict()
+
+    # Stage 1: Baseline model without fairness weights
+    print("\n" + "=" * 60)
+    print("[Stage 1] Training baseline LightGBM (no fairness weights)")
+    print("=" * 60)
+
+    baseline_model = train_lgbm_ranker(
+        X_train=X_train_lgbm,
+        y_train=y_train_lgbm,
+        group_train=group_train,
+        X_val=None,
+        y_val=None,
+        group_val=None,
+        num_leaves=63,
+        learning_rate=0.05,
+        n_estimators=n_estimators,
+        min_data_in_leaf=50,
+        feature_fraction=0.8,
+        lambda_l2=0.0,
+        random_state=random_state,
+        sample_weight=None,
+    )
+
+    print("\nEvaluating baseline LightGBM on test split...")
+    base_recall, base_ndcg, base_user_recs = evaluate_lgbm_on_split(
+        baseline_model,
+        X_items=X_items,
+        train_df=train_df,
+        test_df=test_df,
+        k=10,
+    )
+    base_gini, base_exposure = evaluate_provider_fairness(
+        base_user_recs,
+        item_to_publisher=item_to_publisher,
+        k=10,
+    )
+    print(f"[Baseline] Recall@10: {base_recall:.4f}")
+    print(f"[Baseline] NDCG@10: {base_ndcg:.4f}")
+    print(f"[Baseline] Gini@10: {base_gini:.4f}")
+
+    baseline_metrics = {
+        "recall@10": base_recall,
+        "ndcg@10": base_ndcg,
+        "gini@10": base_gini,
+    }
+
+    # Stage 2: Exposure-aware publisher weights
+    print("\n[Stage 2] Computing exposure-aware publisher weights...")
+    pub_weights_exposure = compute_exposure_correction_weights(
+        base_exposure,
+        items_df=items_df,
+        target_mode=target_mode,
+        power=exp_power,
+    )
+    print("Number of publishers with exposure-aware weights:", len(pub_weights_exposure))
+
+    # Stage 3: Fairness-regularized models
+    lgbm_results = []
+    for lambda_fair in lambda_values:
+        print("\n" + "=" * 60)
+        print(f"[Stage 3] Training LightGBM with exposure-aware lambda_fair = {lambda_fair}")
+        print("=" * 60)
+
+        sample_weights = make_lgbm_sample_weights(
+            item_ids=item_ids_train,
+            items_df=items_df,
+            pub_weights=pub_weights_exposure,
+            lambda_fair=lambda_fair,
+        )
+
+        lgbm_model = train_lgbm_ranker(
+            X_train=X_train_lgbm,
+            y_train=y_train_lgbm,
+            group_train=group_train,
+            X_val=None,
+            y_val=None,
+            group_val=None,
+            num_leaves=63,
+            learning_rate=0.05,
+            n_estimators=n_estimators,
+            min_data_in_leaf=50,
+            feature_fraction=0.8,
+            lambda_l2=0.0,
+            random_state=random_state,
+            sample_weight=sample_weights,
+        )
+
+        print("\nEvaluating LightGBM (exposure-aware) on test split...")
+        lgbm_recall, lgbm_ndcg, lgbm_user_recs = evaluate_lgbm_on_split(
+            lgbm_model,
+            X_items=X_items,
+            train_df=train_df,
+            test_df=test_df,
+            k=10,
+        )
+        lgbm_gini, _ = evaluate_provider_fairness(
+            lgbm_user_recs,
+            item_to_publisher=item_to_publisher,
+            k=10,
+        )
+
+        print(f"LightGBM Recall@10: {lgbm_recall:.4f}")
+        print(f"LightGBM NDCG@10: {lgbm_ndcg:.4f}")
+        print(f"LightGBM Gini@10: {lgbm_gini:.4f}")
+
+        lgbm_results.append(
+            {
+                "lambda_fair": lambda_fair,
+                "recall@10": lgbm_recall,
+                "ndcg@10": lgbm_ndcg,
+                "gini@10": lgbm_gini,
+            }
+        )
+
+    print("\n\n Summary: Exposure-aware LightGBM fairness-accuracy trade-off")
+    print("lambda_fair | Recall@10 | NDCG@10 | Gini@10")
+    for res in lgbm_results:
+        print(
+            f"{res['lambda_fair']:10.2f} | "
+            f"{res['recall@10']:.4f} | "
+            f"{res['ndcg@10']:.4f} | "
+            f"{res['gini@10']:.4f}"
+        )
+
+    return baseline_metrics, lgbm_results
+
 def run_ease_baseline(train_df, test_df, item_to_publisher, lambda_reg: float = 1e3, K: int = 10):
     """
     Train and evaluate the EASE baseline model, including provider fairness.
@@ -251,7 +448,7 @@ def main():
 
     # Preprocessing
     print("\nReindexing user_id and item_id...")
-    interactions_reindexed, new_to_old_user, new_to_old_item = reindex_interactions(interactions_df)
+    interactions_reindexed, _, new_to_old_item = reindex_interactions(interactions_df)
     print("Done. Users:", interactions_reindexed['user_id'].nunique(),
           "Items:", interactions_reindexed['item_id'].nunique())
     
@@ -289,13 +486,13 @@ def main():
     if DEBUG:
         lambda_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
         n_estimators = 100
-        pub_power = 1.5
+        exp_power = 1.5
     else:
         lambda_values = [0.0, 0.2, 0.5, 0.8, 1.0]
         n_estimators = 200
-        pub_power = 1.0
+        exp_power = 1.0
     
-    lgbm_results = run_lgbm_fairness_experiments(
+    baseline_metrics, lgbm_results = run_lgbm_exposure_fairness_experiments(
         train_df=train_df,
         test_df=test_df,
         X_items=X_items,
@@ -304,8 +501,11 @@ def main():
         n_neg_per_pos=4,
         random_state=42,
         n_estimators=n_estimators,
-        pub_power=pub_power,
+        exp_power=exp_power,
+        target_mode="catalog",
     )
+    print("\nBaseline LightGBM metrics (no fairness weights):")
+    print(baseline_metrics)
 
     # EASE baseline
     ease_results = run_ease_baseline(
@@ -321,7 +521,7 @@ def main():
 
         df_lgbm = pd.DataFrame(lgbm_results)
         df_lgbm.to_csv("results_lgbm_inproc_debug.csv", index=False)
-
+        pd.DataFrame([baseline_metrics]).to_csv("baseline_lgbm_debug.csv", index=False)
         ease_results["exposure_df"].to_csv("results_ease_exposure_debug.csv")
         print("\nSaved results to results_lgbm_inproc_debug.csv and results_ease_exposure_debug.csv")
     except Exception as e:

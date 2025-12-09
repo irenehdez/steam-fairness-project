@@ -272,7 +272,9 @@ def run_lgbm_exposure_fairness_experiments(
     }
 
     # Stage 2: Exposure-aware publisher weights
+    print("\n" + "=" * 60)
     print("\n[Stage 2] Computing exposure-aware publisher weights...")
+    print("=" * 60)
     pub_weights_exposure = compute_exposure_correction_weights(
         base_exposure,
         items_df=items_df,
